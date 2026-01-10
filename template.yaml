@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: VCHASNO Analytics Lambda Function with EventBridge and CloudWatch
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 512
+    Runtime: python3.11
+    Environment:
+      Variables:
+        METRICS_NAMESPACE: VCHASNO/Analytics
+        RESULTS_BUCKET: !Ref ResultsBucket
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+
+Resources:
+  # S3 Bucket for analysis results
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub vchasno-analysis-results-${Environment}
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldAnalysis
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Lambda Function
+  AnalyzerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub vchasno-analytics-analyzer-${Environment}
+      Handler: lambda_handler.lambda_handler
+      CodeUri: .
+      Description: VCHASNO document analysis with CloudWatch metrics
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref ResultsBucket
+        - CloudWatchPutMetricPolicy: {}
+        - DynamoDBStreamReadPolicy:
+            TableName: !Ref DocumentsTable
+            StreamName: !GetAtt DocumentsTable.StreamArn
+      Events:
+        ApiGateway:
+          Type: Api
+          Properties:
+            Path: /analyze
+            Method: POST
+            RestApiId: !Ref AnalyticsApi
+        DynamoDBStream:
+          Type: DynamoDBStream
+          Properties:
+            Stream: !GetAtt DocumentsTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref ResultsBucket
+          METRICS_NAMESPACE: !Sub VCHASNO/Analytics/${Environment}
+          DOCUMENTS_TABLE: !Ref DocumentsTable
+
+  # API Gateway
+  AnalyticsApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub vchasno-analytics-api-${Environment}
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'POST, GET, OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+      Auth:
+        ApiKeyRequired: true
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub vchasno-api-key-${Environment}
+      Enabled: true
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: !Sub vchasno-usage-plan-${Environment}
+      ApiStages:
+        - ApiId: !Ref AnalyticsApi
+          Stage: !Ref Environment
+      Quota:
+        Limit: 10000
+        Period: MONTH
+      Throttle:
+        BurstLimit: 200
+        RateLimit: 100
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  # DynamoDB Table
+  DocumentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub vchasno-documents-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: document_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: document_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        Enabled: true
+        AttributeName: ttl
+
+  # EventBridge Rule for scheduled analytics
+  ScheduledAnalyticsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub vchasno-scheduled-analytics-${Environment}
+      Description: Trigger analytics every hour
+      ScheduleExpression: rate(1 hour)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AnalyzerFunction.Arn
+          Id: AnalyzerFunctionTarget
+          Input: '{"action": "scheduled_stats"}'
+
+  EventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AnalyzerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledAnalyticsRule.Arn
+
+  # CloudWatch Alarms
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub vchasno-analyzer-errors-${Environment}
+      AlarmDescription: Alert when Lambda errors exceed threshold
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AnalyzerFunction
+
+  LatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub vchasno-analyzer-latency-${Environment}
+      AlarmDescription: Alert when p95 latency exceeds 1 second
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AnalyzerFunction
+
+  # CloudWatch Log Group
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AnalyzerFunction}
+      RetentionInDays: 7
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${AnalyticsApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/analyze
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiEndpoint
+
+  FunctionArn:
+    Description: Lambda Function ARN
+    Value: !GetAtt AnalyzerFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-FunctionArn
+
+  ResultsBucketName:
+    Description: S3 Bucket for results
+    Value: !Ref ResultsBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-ResultsBucket
+
+  DocumentsTableName:
+    Description: DynamoDB Table Name
+    Value: !Ref DocumentsTable
+    Export:
+      Name: !Sub ${AWS::StackName}-DocumentsTable
+
+  ApiKeyId:
+    Description: API Key ID
+    Value: !Ref ApiKey
